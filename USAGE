@@ -1,0 +1,679 @@
+# Agent Platform 使用文档
+
+> 内部业务智能体平台，融合 RAG 知识库、工作流编排、插件热加载、多租户隔离、可观测性等能力。
+
+---
+
+## 目录
+
+1. [系统概述](#系统概述)
+2. [技术栈](#技术栈)
+3. [系统架构](#系统架构)
+4. [模块职责](#模块职责)
+5. [数据库表结构](#数据库表结构)
+6. [前置依赖](#前置依赖)
+7. [本地开发部署](#本地开发部署)
+8. [Docker Compose 部署](#docker-compose-部署)
+9. [环境变量参考](#环境变量参考)
+10. [API 路由总览](#api-路由总览)
+11. [多租户安全模型](#多租户安全模型)
+12. [可观测性](#可观测性)
+13. [插件开发指南](#插件开发指南)
+14. [常见问题](#常见问题)
+
+---
+
+## 系统概述
+
+Agent Platform 是一个面向企业内部的 AI 智能体平台，核心能力包括：
+
+- **多租户隔离**：租户/工作空间两级隔离，所有数据严格按 tenant_id 隔离
+- **对话会话**：支持多轮对话，对接 OpenAI、通义千问、智谱 AI 等多种模型
+- **工作流编排**：可视化节点编排，支持 LLM、Tool、条件分支、人工审批节点
+- **RAG 知识库**：文档上传、向量化、混合检索（向量 0.7 + BM25 0.3）
+- **Skills 复用**：封装为带版本的可复用 Skill，工作空间按版本安装
+- **插件热加载**：JAR 包热上传，`ChildFirstClassLoader` 隔离，无需重启
+- **轨迹记录**：所有 LLM 调用和工具执行均记录不可变事件
+- **用量统计**：按月聚合 token 消耗，支持费用估算
+- **审计导出**：管理员可导出指定时间范围的 JSON / CSV 审计日志
+
+---
+
+## 技术栈
+
+| 层级 | 技术 |
+|------|------|
+| 语言 | Java 21（Virtual Threads） |
+| 框架 | Spring Boot 3.3.5 / Spring Cloud 2023.0.3 |
+| AI 适配 | Spring AI 1.0.0-M6（统一 OpenAI-compatible 接口） |
+| 插件注解 | LangChain4j 0.35.0（`@Tool` / `@AgentPlugin`） |
+| 数据库 | PostgreSQL 16 + Flyway 自动迁移 |
+| 缓存 | Redis 7（工作流节点上下文） |
+| 前端 | Vue 3 + Vite + Pinia + Vue Flow（工作流画布） |
+| 网关 | Spring Cloud Gateway |
+| 认证 | OAuth2 / OIDC JWT（Keycloak 或其他 OIDC Provider） |
+| 可观测性 | Micrometer + Prometheus + OpenTelemetry（OTel） |
+| 日志 | Logback（开发模式纯文本，生产模式 Logstash JSON） |
+| 构建 | Maven 3.9（多模块） |
+| 容器 | Docker + Docker Compose |
+
+---
+
+## 系统架构
+
+```
+浏览器 / API 客户端
+        │
+        ▼
+  ┌─────────────────────────────────────────┐
+  │   Gateway（:8080）                       │
+  │   · JWT 验证 & 解析                      │
+  │   · 强制注入 X-Tenant-Id / X-User-Id    │
+  │   · 路由到下游服务                        │
+  └──────────────────┬──────────────────────┘
+                     │
+      ┌──────────────┼──────────────────────────────┐
+      │              │              │               │
+      ▼              ▼              ▼               ▼
+ auth-service  session-service  workflow-service  rag-service
+  (:8081)        (:8082)          (:8086)          (:8087)
+  租户/工作空间   对话会话/消息    工作流定义/执行   知识库/文档
+
+      │              │              │               │
+      ▼              ▼              ▼               ▼
+ skill-service  plugin-service  trajectory-service
+  (:8084)         (:8083)          (:8085)
+  Skills复用      插件热加载       轨迹记录/用量统计
+
+共享基础设施：PostgreSQL 16 + Redis 7
+```
+
+**请求流转示例（对话）：**
+
+```
+Client → Gateway（验证JWT，注入租户头）
+       → session-service（创建/查询会话）
+       → session-service（调用 ModelAdapterService → LLM API）
+       → trajectory-service（记录 LLM_REQUEST / LLM_RESPONSE 事件）
+```
+
+---
+
+## 模块职责
+
+### common
+共享库，不独立部署。
+
+- `TenantContext` / `UserContext`：ThreadLocal 存储当前请求的租户 ID 和用户 ID
+- `TenantInterceptor`：从 `X-Tenant-Id` / `X-User-Id` 请求头读取并填入 Context，同时写入 MDC
+- `TenantWebMvcConfigurer`：自动注册 TenantInterceptor 到所有 `/api/**` 路由
+- `MdcTaskDecorator`：异步线程池的 MDC 传播
+- `MemberRoleProvider` / `TenantPermissionEvaluator`：方法级 `@PreAuthorize` 权限判断
+- `logback-spring.xml`：开发纯文本 / 生产 JSON 双模式日志
+- `application-observability.yml`：Prometheus 端点配置
+
+### gateway（:8080）
+唯一对外入口，所有外部流量必须经过此服务。
+
+- 验证 JWT，提取 `tenantId`（claim `tenant_id`）和 `userId`（JWT subject）
+- 通过 `TenantRoutingFilter` 强制覆写下游请求头 `X-Tenant-Id` 和 `X-User-Id`，下游服务无法被客户端伪造这两个头
+- 路由规则见 [API 路由总览](#api-路由总览)
+
+### auth-service（:8081）
+租户和工作空间的 CRUD 管理。
+
+- 管理 `tenant`、`workspace`、`member` 三张表
+- Member 有 `OWNER` / `ADMIN` / `MEMBER` 三种角色
+- 提供工作空间成员查询接口，供其他服务鉴权使用
+
+### session-service（:8082）
+对话会话管理和 LLM 调用适配。
+
+- 创建/查询会话（`session` 表）和消息（`message` 表）
+- `ModelAccountConfig`：每个工作空间可配置多个模型账户，支持设置默认模型
+- `ChatModelFactory`：根据 provider 字段路由到对应 API endpoint
+  - `openai` → `https://api.openai.com`
+  - `qianwen` → `https://dashscope.aliyuncs.com/compatible-mode/v1`
+  - `zhipu` → `https://open.bigmodel.cn/api/paas/v4`
+  - 均使用 Spring AI `OpenAiChatModel` 适配，新增 provider 只需添加一个 case
+- 支持同步对话和 SSE 流式对话
+
+### workflow-service（:8086）
+工作流定义和执行引擎。
+
+- 工作流定义以 JSON 存入 `workflow_definition.definition` 字段
+- 节点类型：`LLM` / `TOOL` / `CONDITION` / `APPROVAL` / `START` / `END`
+- 工作流运行状态机：`PENDING → RUNNING → COMPLETED / FAILED / REJECTED`
+- 人工审批节点：创建 `approval_request`，发送 Webhook 通知审批人，支持过期自动拒绝
+- 节点上下文存储在 Redis（key = `workflow_run:{runId}`）
+- 前端可视化画布由 Vue Flow 实现
+
+### rag-service（:8087）
+知识库和文档检索。
+
+- 管理 `knowledge_base` 和 `rag_document` 表
+- 文档上传后进行分块（chunking）和向量化（调用 Embedding API）
+- 向量存储使用 PGVector（需 PostgreSQL 安装 pgvector 扩展）
+- 检索策略：向量相似度（权重 0.7）+ BM25 全文检索（权重 0.3）+ rerank（阈值 0.5）
+
+### skill-service（:8084）
+可复用 Skill 的版本管理。
+
+- `skill`：Skill 的元数据（名称、描述）
+- `skill_version`：具体版本，包含 `system_prompt`、`required_tools`、`input_schema`
+- `workspace_skill_install`：工作空间安装指定版本的 Skill，安装时锁定版本
+- 同一工作空间对同一 Skill 重复安装视为替换
+
+### plugin-service（:8083）
+工具插件的注册和热加载。
+
+- 静态插件：`plugin_definition` + `workspace_plugin` 表管理插件元数据
+- 动态插件（热加载）：
+  - `PluginJarLoader`：扫描 JAR 文件，找到 `@AgentPlugin` 注解类，解析 `@Tool` 方法生成 `ToolDefinition`
+  - `ChildFirstClassLoader`：每个插件独立 ClassLoader，子类优先加载，注解包委托 parent，保证类型同一性
+  - `PluginRegistry`：内存注册表，`registerDynamic()` 原子操作，`unload()` 关闭 ClassLoader 释放 JAR 句柄
+  - JAR 上传使用原子文件移动（atomic move），并发安全
+- HTTP API：`POST /api/v1/plugins/jars/{pluginId}`（上传）、`DELETE`（卸载）、`GET`（列出）
+
+### trajectory-service（:8085）
+不可变事件记录、用量统计、审计导出。
+
+- `trajectory_event`：所有 LLM 调用和工具执行的不可变事件（append-only）
+- `usage_record`：按月聚合的 token 用量，幂等 upsert（同 tenant+workspace+period+model 唯一）
+- `UsageAggregator.aggregateMonth()`：从 trajectory_event 聚合当月所有 token，支持重复调用（结果一致）
+- `AuditExportService`：需要 `ADMIN` 角色，支持按时间范围导出 JSON 或 CSV
+
+### frontend
+Vue 3 单页应用。
+
+- `LoginView`：获取 JWT token
+- `SessionView`：多���对话界面
+- `WorkflowView`：工作流列表 + Vue Flow 可视化画布编辑器
+- `TrajectoryView`：轨迹事件查看
+
+---
+
+## 数据库表结构
+
+所有服务共用同一个 PostgreSQL 数据库（`agent_platform`），通过 Flyway 自动建表。
+
+### auth-service 表
+| 表名 | 说明 |
+|------|------|
+| `tenant` | 租户，id/name |
+| `workspace` | 工作空间，属于租户 |
+| `member` | 工作空间成员，role: OWNER/ADMIN/MEMBER |
+
+### session-service 表
+| 表名 | 说明 |
+|------|------|
+| `model_account` | 模型账户配置，含 provider/api_key/base_url/is_default |
+| `session` | 对话会话，含 status: ACTIVE/ARCHIVED |
+| `message` | 消息记录，含 role: USER/ASSISTANT/SYSTEM 和 token_usage |
+
+### workflow-service 表
+| 表名 | 说明 |
+|------|------|
+| `workflow_definition` | 工作流定义，definition 字段存 JSON 节点图 |
+| `workflow_run` | 工作流运行实例，含状态机和 context_key（Redis key） |
+| `approval_request` | 人工审批请求，含 status: PENDING/APPROVED/REJECTED 和过期时间 |
+
+### rag-service 表
+| 表名 | 说明 |
+|------|------|
+| `knowledge_base` | 知识库，属于工作空间 |
+| `rag_document` | 文档，含 status: PENDING/PROCESSING/READY/FAILED 和 chunk_count |
+
+### skill-service 表
+| 表名 | 说明 |
+|------|------|
+| `skill` | Skill 元数据 |
+| `skill_version` | 版本快照，含 system_prompt/required_tools/input_schema |
+| `workspace_skill_install` | 工作空间安装记录，安装时锁定 skill_version_id |
+
+### plugin-service 表
+| 表名 | 说明 |
+|------|------|
+| `plugin_definition` | 插件元数据，id 为字符串（如 `com.example.search:1.0`） |
+| `workspace_plugin` | 工作空间已安装插件 |
+
+### trajectory-service 表
+| 表名 | 说明 |
+|------|------|
+| `trajectory_event` | 不可变轨迹事件，含 event_type/payload/token_usage |
+| `usage_record` | 月度用量聚合，UNIQUE(tenant_id, workspace_id, period_start, model_name) |
+
+---
+
+## 前置依赖
+
+### 必须
+| 依赖 | 版本 | 用途 |
+|------|------|------|
+| JDK | 21+ | 编译和运行（需支持 Virtual Threads） |
+| Maven | 3.9+ | 构建 |
+| PostgreSQL | 16+ | 主数据库 |
+| Redis | 7+ | 工作流节点上下文缓存 |
+| OIDC Provider | 任意 | JWT 签发（推荐 Keycloak） |
+| Docker & Docker Compose | 24+ | 容器化部署 |
+
+### 可选
+| 依赖 | 用途 |
+|------|------|
+| PGVector 扩展 | RAG 向量检索（`CREATE EXTENSION vector`） |
+| OpenTelemetry Collector | 分布式链路追踪汇聚 |
+| Prometheus + Grafana | 指标监控 |
+| Node.js 20+ | 前端本地开发 |
+
+---
+
+## 本地开发部署
+
+### 1. 启动基础设施
+
+```bash
+# 仅启动 PostgreSQL 和 Redis
+docker compose up postgres redis -d
+```
+
+### 2. 初始化数据库
+
+Flyway 在每个服务启动时自动执行 migration，无需手动建表。
+
+如果使用 RAG 功能，需要在 PostgreSQL 中安装 pgvector：
+
+```sql
+CREATE EXTENSION IF NOT EXISTS vector;
+```
+
+### 3. 配置环境变量
+
+创建 `.env` 文件（或直接 export）：
+
+```bash
+export DB_URL=jdbc:postgresql://localhost:5432/agent_platform
+export DB_USERNAME=postgres
+export DB_PASSWORD=postgres
+export OIDC_ISSUER_URI=http://localhost:9000
+export OIDC_JWK_SET_URI=http://localhost:9000/.well-known/jwks.json
+export OPENAI_API_KEY=sk-xxxxxxxx          # 使用 OpenAI 时必填
+export OPENAI_BASE_URL=https://api.openai.com  # 国内模型改为对应地址
+```
+
+### 4. 编译
+
+```bash
+cd agent-platform
+mvn clean package -DskipTests
+```
+
+### 5. 按顺序启动服务
+
+```bash
+# 1. gateway（其他服务依赖网关鉴权）
+java -jar gateway/target/gateway-*.jar
+
+# 2. auth-service
+java -jar auth-service/target/auth-service-*.jar
+
+# 3. 业务服务（可并行启动）
+java -jar session-service/target/session-service-*.jar
+java -jar workflow-service/target/workflow-service-*.jar
+java -jar rag-service/target/rag-service-*.jar
+java -jar skill-service/target/skill-service-*.jar
+java -jar plugin-service/target/plugin-service-*.jar
+java -jar trajectory-service/target/trajectory-service-*.jar
+```
+
+### 6. 启动前端
+
+```bash
+cd frontend
+npm install
+npm run dev    # 开发服务器，默认 :5173
+```
+
+---
+
+## Docker Compose 部署
+
+### 快速启动
+
+```bash
+cd agent-platform
+
+# 设置必要的环境变量
+export OPENAI_API_KEY=sk-xxxxxxxx
+
+# 启动所有服务
+docker compose up -d
+```
+
+### 验证启动状态
+
+```bash
+docker compose ps
+
+# 检查各服务健康
+curl http://localhost:8080/actuator/health   # gateway
+curl http://localhost:8081/actuator/health   # auth-service
+curl http://localhost:8082/actuator/health   # session-service
+```
+
+### 查看日志
+
+```bash
+# 查看所有服务日志
+docker compose logs -f
+
+# 查看指定服务
+docker compose logs -f session-service
+```
+
+### 停止服务
+
+```bash
+docker compose down          # 保留数据卷
+docker compose down -v       # 同时删除数据卷（会清空数据库）
+```
+
+### 重新构建镜像
+
+```bash
+docker compose build --no-cache
+docker compose up -d
+```
+
+---
+
+## 环境变量参考
+
+| 变量名 | 默认值 | 说明 | 影响服务 |
+|--------|--------|------|----------|
+| `DB_URL` | `jdbc:postgresql://localhost:5432/agent_platform` | 数据库连接 URL | 全部 |
+| `DB_USERNAME` | `postgres` | 数据库用户名 | 全部 |
+| `DB_PASSWORD` | `postgres` | 数据库密码 | 全部 |
+| `OIDC_ISSUER_URI` | `http://localhost:9000` | OIDC Provider issuer 地址 | gateway、auth、session、plugin |
+| `OIDC_JWK_SET_URI` | `http://localhost:9000/.well-known/jwks.json` | JWK Set 地址 | gateway、auth、session、plugin |
+| `OPENAI_API_KEY` | `placeholder` | LLM API Key | session-service、rag-service |
+| `OPENAI_BASE_URL` | `https://api.openai.com` | LLM API base URL，国内模型改此值 | session-service、rag-service |
+| `REDIS_HOST` | `localhost` | Redis 主机 | workflow-service |
+| `REDIS_PORT` | `6379` | Redis 端口 | workflow-service |
+| `APPROVAL_WEBHOOK_URL` | 空 | 审批通知 Webhook 地址（企业 IM） | workflow-service |
+| `AUTH_SERVICE_URI` | `http://localhost:8081` | Gateway 路由 | gateway |
+| `SESSION_SERVICE_URI` | `http://localhost:8082` | Gateway 路由 | gateway |
+| `TRAJECTORY_SERVICE_URI` | `http://localhost:8085` | Gateway 路由 | gateway |
+| `WORKFLOW_SERVICE_URI` | `http://localhost:8086` | Gateway 路由 | gateway |
+| `RAG_SERVICE_URI` | `http://localhost:8087` | Gateway 路由 | gateway |
+| `SKILL_SERVICE_URI` | `http://localhost:8084` | Gateway 路由 | gateway |
+| `PLUGIN_SERVICE_URI` | `http://localhost:8083` | Gateway 路由 | gateway |
+
+---
+
+## API 路由总览
+
+所有请求通过 Gateway（`:8080`）进入，需携带 `Authorization: Bearer <JWT>` header。
+
+| 路径前缀 | 目标服务 | 说明 |
+|----------|----------|------|
+| `/api/v1/tenants/**` | auth-service | 租户管理 |
+| `/api/v1/workspaces/**` | auth-service | 工作空间 / 成员管理 |
+| `/api/v1/sessions/**` | session-service | 会话 / 消息 / 模型账户 |
+| `/api/v1/sessions/*/trajectory/**` | trajectory-service | 轨迹事件查询 |
+| `/api/v1/workflows/**` | workflow-service | 工作流定义 / 执行 / 审批 |
+| `/api/v1/knowledge-bases/**` | rag-service | 知识库 / 文档 / 检索 |
+| `/api/v1/skills/**` | skill-service | Skill 管理 / 安装 |
+| `/api/v1/plugins/**` | plugin-service | 静态插件注册 / 热加载 |
+| `/api/v1/workspaces/*/tools/**` | plugin-service | 工作空间工具列表 |
+| `/api/v1/usage/**` | trajectory-service | 月度用量统计 |
+| `/api/v1/audit/**` | trajectory-service | 审计日志导出（需 ADMIN） |
+
+### 关键 API 示例
+
+```bash
+# 创建会话
+POST /api/v1/sessions
+Authorization: Bearer <JWT>
+Content-Type: application/json
+{"workspaceId": "uuid", "title": "我的对话"}
+
+# 发送消息（同步）
+POST /api/v1/sessions/{sessionId}/messages
+{"content": "你好"}
+
+# 查询月度用量
+GET /api/v1/usage/{workspaceId}/monthly?month=2026-11
+Authorization: Bearer <JWT>
+X-Tenant-Id: <自动由 Gateway 注入，客户端无需手动设置>
+
+# 导出审计日志（需 ADMIN 角色）
+GET /api/v1/audit/{workspaceId}/export.json?from=2026-11-01T00:00:00Z&to=2026-11-30T23:59:59Z
+
+# 热上传插件 JAR
+POST /api/v1/plugins/jars/{pluginId}
+Content-Type: application/octet-stream
+<JAR 文件二进制>
+```
+
+---
+
+## 多租户安全模型
+
+平台采用双层隔离保证租户数据安全：
+
+### 1. 网关层强制注入
+
+Gateway 的 `TenantRoutingFilter` 验证 JWT 后，从 JWT claims 中提取 `tenantId` 和 `userId`，**强制覆写**下游请求的 `X-Tenant-Id` 和 `X-User-Id` 请求头。客户端即使在请求中伪造这两个头也会被覆盖。
+
+### 2. 服务层上下文隔离
+
+每个下游服务的 `TenantInterceptor`（通过 `TenantWebMvcConfigurer` 自动注册）读取这两个 header，存入 `TenantContext`（ThreadLocal）和 `UserContext`（ThreadLocal），同时写入 MDC 供日志追踪。
+
+### 3. 数据访问层隔离
+
+所有业务表都包含 `tenant_id` 字段，服务层查询时显式传入 `TenantContext.get()` 作为查询条件，从不信任客户端传入的 tenantId。
+
+### 4. 资源所有权验证（IDOR 防护）
+
+访问具体资源时，先加载资源再验证 `resource.tenantId == currentTenantId`，不匹配抛 `ForbiddenException`（HTTP 403），不暴露资源是否存在。
+
+---
+
+## 可观测性
+
+### Prometheus 指标
+
+各服务已集成 Micrometer，暴露 Prometheus 格式指标：
+
+```bash
+# 查看指标（需配置 observability profile）
+curl http://localhost:8082/actuator/prometheus
+```
+
+Prometheus 抓取配置示例：
+
+```yaml
+scrape_configs:
+  - job_name: 'agent-platform'
+    static_configs:
+      - targets:
+          - 'session-service:8082'
+          - 'workflow-service:8086'
+          - 'trajectory-service:8085'
+          - 'rag-service:8087'
+          - 'skill-service:8084'
+          - 'plugin-service:8083'
+    metrics_path: '/actuator/prometheus'
+```
+
+### 分布式追踪
+
+服务已集成 OpenTelemetry，通过以下环境变量配置 OTel Collector 地址：
+
+```bash
+OTEL_EXPORTER_OTLP_ENDPOINT=http://otel-collector:4317
+```
+
+每条日志和每个 span 都携带 `traceId`、`spanId`、`tenantId`，便于跨服务链路追踪。
+
+### 结构化日志
+
+生产环境（`SPRING_PROFILES_ACTIVE=production`）启用 Logstash JSON 格式：
+
+```json
+{
+  "timestamp": "2026-11-26T06:20:31.363Z",
+  "level": "INFO",
+  "logger": "com.example.session.service.ChatService",
+  "message": "LLM call completed",
+  "traceId": "abc123",
+  "spanId": "def456",
+  "tenantId": "uuid"
+}
+```
+
+---
+
+## 插件开发指南
+
+### 1. 引入注解依赖
+
+```xml
+<dependency>
+    <groupId>dev.langchain4j</groupId>
+    <artifactId>langchain4j</artifactId>
+    <version>0.35.0</version>
+</dependency>
+<dependency>
+    <groupId>com.example</groupId>
+    <artifactId>plugin-annotation</artifactId>
+    <version>0.0.1-SNAPSHOT</version>
+</dependency>
+```
+
+### 2. 编写插件类
+
+```java
+@AgentPlugin(id = "com.example.weather:1.0", name = "天气查询")
+public class WeatherPlugin {
+
+    @Tool("查询指定城市的天气")
+    public String getWeather(String city) {
+        // 实现天气查询逻辑
+        return "晴，25°C";
+    }
+}
+```
+
+**注意**：插件 JAR 中不得打包 `com.example.plugin.annotation.*` 类，该包由平台 ClassLoader 提供。
+
+### 3. 打包
+
+```bash
+mvn package -DskipTests
+```
+
+### 4. 上传热加载
+
+```bash
+curl -X POST http://localhost:8080/api/v1/plugins/jars/com.example.weather:1.0 \
+  -H "Authorization: Bearer <JWT>" \
+  -H "Content-Type: application/octet-stream" \
+  --data-binary @target/weather-plugin-1.0.jar
+```
+
+### 5. 卸载
+
+```bash
+curl -X DELETE http://localhost:8080/api/v1/plugins/jars/com.example.weather:1.0 \
+  -H "Authorization: Bearer <JWT>"
+```
+
+---
+
+## 常见问题
+
+### Q: 启动时报 `Flyway migration failed`
+
+原因通常是数据库不存在或权限不足。
+
+```bash
+# 创建数据库
+psql -U postgres -c "CREATE DATABASE agent_platform;"
+
+# 如使用 RAG，安装 pgvector
+psql -U postgres -d agent_platform -c "CREATE EXTENSION IF NOT EXISTS vector;"
+```
+
+### Q: JWT 验证失败（401 Unauthorized）
+
+检查 `OIDC_ISSUER_URI` 和 `OIDC_JWK_SET_URI` 是否正确，且 OIDC Provider 可从服务网络访问到。
+
+### Q: 国内模型（通义千问 / 智谱）如何接入
+
+在数据库的 `model_account` 表中插入记录，`provider` 字段填 `qianwen` 或 `zhipu`，`api_key` 填对应平台的 API Key，`base_url` 留空（平台内置地址）。
+
+```sql
+INSERT INTO model_account (id, tenant_id, workspace_id, provider, model_name, api_key, is_default)
+VALUES (random_uuid(), '<tenant_id>', '<workspace_id>', 'qianwen', 'qwen-turbo', 'sk-xxx', true);
+```
+
+### Q: 工作流卡在 RUNNING 状态
+
+Redis 故障或服务重启可能导致节点上下文丢失。处理方式：
+
+```sql
+-- 查询卡住的 Run
+SELECT * FROM workflow_run WHERE status = 'RUNNING' AND started_at < NOW() - INTERVAL '1 hour';
+
+-- 手动标记为 FAILED（人工介入）
+UPDATE workflow_run SET status = 'FAILED', error_message = 'Manual intervention' WHERE id = '<run_id>';
+```
+
+### Q: 插件热加载后调用报 `ClassNotFoundException`
+
+常见原因：插件 JAR 中打包了 `com.example.plugin.annotation.*`，导致 ClassLoader 类型不一致。重新打包时排除该包：
+
+```xml
+<plugin>
+    <groupId>org.apache.maven.plugins</groupId>
+    <artifactId>maven-jar-plugin</artifactId>
+    <configuration>
+        <excludes>
+            <exclude>com/example/plugin/annotation/**</exclude>
+        </excludes>
+    </configuration>
+</plugin>
+```
+
+### Q: Prometheus 端点返回 404
+
+需要激活 `observability` profile：
+
+```bash
+java -jar session-service.jar --spring.profiles.active=observability
+# 或设置环境变量
+export SPRING_PROFILES_INCLUDE=observability
+```
+
+### Q: 运行测试时报 `LogstashEncoder ClassNotFoundException`
+
+这是已知问题，已修复。确保 `logback-spring.xml` 使用 `production` profile 策略（而非 `!test`），测试环境默认使用纯文本 appender，不加载 LogstashEncoder。
+
+---
+
+## 端口速查
+
+| 服务 | 端口 |
+|------|------|
+| Frontend | 80（Docker）/ 5173（开发） |
+| Gateway | 8080 |
+| auth-service | 8081 |
+| session-service | 8082 |
+| plugin-service | 8083 |
+| skill-service | 8084 |
+| trajectory-service | 8085 |
+| workflow-service | 8086 |
+| rag-service | 8087 |
+| PostgreSQL | 5432 |
+| Redis | 6379 |
